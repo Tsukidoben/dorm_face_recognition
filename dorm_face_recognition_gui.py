@@ -1,3 +1,4 @@
+import pickle
 import sys
 import os
 import cv2
@@ -16,7 +17,8 @@ import joblib
 import logging
 import json
 from datetime import datetime
-
+# 在 dorm_face_recognition_gui.py 顶部添加导入
+from face_recognition import FaceRecognition
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -45,18 +47,18 @@ class FeedbackDialog(QDialog):
         # 使用表格显示结果
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(4)
-        self.results_table.setHorizontalHeaderLabels(["ID", "识别结果", "置信度", "位置"])
+        self.results_table.setHorizontalHeaderLabels(["ID", "识别结果", "置信度", "位置和大小"])
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
         # 填充表格数据
         self.results_table.setRowCount(len(self.last_results))
         for i, result in enumerate(self.last_results):
+            x, y, w, h = result["box"]
             self.results_table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
             self.results_table.setItem(i, 1, QTableWidgetItem(result["label"]))
             self.results_table.setItem(i, 2, QTableWidgetItem(f"{result['confidence']:.2f}"))
-            x, y = result.get("position", (0, 0))
-            self.results_table.setItem(i, 3, QTableWidgetItem(f"({x}, {y})"))
+            self.results_table.setItem(i, 3, QTableWidgetItem(f"({x}, {y}) - {w}x{h}"))
 
         # 设置表格样式
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -111,9 +113,10 @@ class FeedbackDialog(QDialog):
             "original_label": selected_result["label"],
             "correct_label": self.correct_combo.currentData(),
             "confidence": selected_result["confidence"],
-            "position": selected_result.get("position", (0, 0)),
+            "box": selected_result["box"],  # 保存完整的框信息
             "note": self.note_text.toPlainText().strip()
         }
+
 
 
 class FaceRecognitionSystem(QMainWindow):
@@ -156,6 +159,9 @@ class FaceRecognitionSystem(QMainWindow):
         # 状态栏
         self.status_bar = self.statusBar()
         self.status_bar.showMessage("系统初始化中...")
+
+        # 初始化人脸识别器 - 关键修复
+        self.face_recognition = FaceRecognition()
 
         # 初始化UI组件
         self.init_ui()
@@ -330,9 +336,27 @@ class FaceRecognitionSystem(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             feedback_data = dialog.get_feedback_data()
             if feedback_data:
-                self.save_feedback(feedback_data)
-                QMessageBox.information(self, "反馈提交", "感谢您的反馈！数据已保存用于改进模型")
+                # 修复：调用 FaceRecognition 实例的 save_feedback 方法
+                selected_result = dialog.get_selected_result()
+                if selected_result:
+                    # 获取检测框
+                    detected_box = [
+                        selected_result["box"][0],
+                        selected_result["box"][1],
+                        selected_result["box"][0] + selected_result["box"][2],
+                        selected_result["box"][1] + selected_result["box"][3]
+                    ]
 
+                    # 调用保存反馈方法
+                    self.face_recognition.save_feedback(
+                        self.current_image,
+                        detected_box,
+                        feedback_data["original_label"],
+                        feedback_data["correct_label"]
+                    )
+                    QMessageBox.information(self, "反馈提交", "感谢您的反馈！数据已保存用于改进模型")
+                else:
+                    QMessageBox.warning(self, "反馈错误", "未选择要反馈的人脸结果")
 
     def init_models(self):
         """初始化模型组件"""
@@ -480,8 +504,18 @@ class FaceRecognitionSystem(QMainWindow):
         """使用反馈数据重新训练模型"""
         # 获取所有反馈数据
         feedback_dir = os.path.join(os.getcwd(), "data", "feedback_data")
-        feedback_files = [f for f in os.listdir(feedback_dir)
-                          if f.endswith('.json') and os.path.isfile(os.path.join(feedback_dir, f))]
+
+        # 修复1：支持多种文件扩展名
+        feedback_files = []
+        for f in os.listdir(feedback_dir):
+            filepath = os.path.join(feedback_dir, f)
+            if os.path.isfile(filepath) and (f.endswith('.pkl') or f.endswith('.json')):
+                feedback_files.append(f)
+
+        # 修复2：添加目录存在性检查
+        if not os.path.exists(feedback_dir):
+            QMessageBox.warning(self, "目录不存在", f"反馈数据目录不存在: {feedback_dir}")
+            return
 
         if not feedback_files:
             QMessageBox.information(self, "无反馈数据", "没有找到反馈数据，无法重新训练")
@@ -510,9 +544,18 @@ class FaceRecognitionSystem(QMainWindow):
             feedback_data = []
             for i, filename in enumerate(feedback_files):
                 filepath = os.path.join(feedback_dir, filename)
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    feedback_data.append(data)
+
+                # 修复3：根据文件扩展名使用不同的加载方式
+                if filename.endswith('.pkl'):
+                    with open(filepath, 'rb') as f:  # 二进制模式读取
+                        data = pickle.load(f)
+                elif filename.endswith('.json'):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                else:
+                    continue  # 跳过不支持的文件类型
+
+                feedback_data.append(data)
 
                 progress.setValue(i + 1)
                 QApplication.processEvents()  # 保持UI响应
@@ -524,11 +567,26 @@ class FaceRecognitionSystem(QMainWindow):
 
             # 重新训练模型
             self.status_bar.showMessage("正在重新训练模型...")
-            self.face_recognition.retrain_with_feedback(feedback_data)
 
-            # 更新UI状态
-            self.model_status.setText("模型状态: 已重新训练")
-            QMessageBox.information(self, "训练完成", "模型已成功使用反馈数据重新训练！")
+            # 修复4：添加详细的日志记录
+            logger.info(f"开始重新训练，使用 {len(feedback_data)} 条反馈数据")
+
+            # 调用重新训练方法
+            success = self.face_recognition.retrain_with_feedback(feedback_data)
+
+            if success:
+                # 更新UI状态
+                self.model_status.setText("模型状态: 已重新训练")
+                self.dorm_members = self.face_recognition.dorm_members
+                self.model_info.setText(f"寝室成员: {', '.join(self.dorm_members)}")
+
+                # 保存更新后的模型
+                model_path = os.path.join("models", "updated_model.pkl")
+                self.face_recognition.save_updated_model(model_path)
+
+                QMessageBox.information(self, "训练完成", "模型已成功使用反馈数据重新训练！")
+            else:
+                QMessageBox.warning(self, "训练失败", "重新训练过程中出现问题")
 
         except Exception as e:
             logger.error(f"重新训练失败: {str(e)}")
@@ -612,9 +670,9 @@ class FaceRecognitionSystem(QMainWindow):
                             label = pred_label
                             color = (0, 255, 0)  # 绿色
 
-                        # 保存结果用于文本显示
+                        # 保存结果用于文本显示 - 修复：保存完整的框信息
                         result = {
-                            "position": (int(x1), int(y1)),
+                            "box": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],  # [x, y, width, height]
                             "label": label,
                             "confidence": max_prob
                         }
@@ -656,7 +714,7 @@ class FaceRecognitionSystem(QMainWindow):
         # 构建结果文本
         result_text = "<h3>识别结果：</h3>"
         for i, result in enumerate(self.last_results, 1):
-            x, y = result["position"]
+            x, y, w, h = result["box"]
             label = result["label"]
             confidence = result["confidence"]
 
@@ -665,16 +723,17 @@ class FaceRecognitionSystem(QMainWindow):
                 result_text += (
                     f"<p><b>人脸 #{i}:</b> "
                     f"<span style='color:green;'>寝室成员 - {label}</span><br>"
-                    f"位置: ({x}, {y}), 置信度: {confidence:.2f}</p>"
+                    f"位置: ({x}, {y}), 大小: {w}x{h}, 置信度: {confidence:.2f}</p>"
                 )
             else:
                 result_text += (
                     f"<p><b>人脸 #{i}:</b> "
                     f"<span style='color:red;'>陌生人</span><br>"
-                    f"位置: ({x}, {y}), 置信度: {confidence:.2f}</p>"
+                    f"位置: ({x}, {y}), 大小: {w}x{h}, 置信度: {confidence:.2f}</p>"
                 )
 
         self.results_text.setHtml(result_text)
+
 
     def preprocess_face(self, face_img):
         """预处理人脸图像"""

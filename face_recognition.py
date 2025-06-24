@@ -1,3 +1,5 @@
+import json
+
 import cv2
 import numpy as np
 import torch
@@ -12,6 +14,8 @@ from datetime import datetime
 import random
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.preprocessing import LabelEncoder
+from sklearn.svm import SVC
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -19,15 +23,17 @@ class FaceRecognition:
     def __init__(self, device=None):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model_loaded = False
+        self.training_data = {}  # 初始化 training_data 属性
+        self.dorm_members = []   # 初始化 dorm_members 属性
+        self.label_encoder = LabelEncoder()  # 初始化标签编码器
         self.init_models()
 
     def init_models(self):
         """初始化人脸识别模型"""
         try:
-            # 初始化ArcFace模型
-            self.arcface_model = FaceAnalysis()
+            # 初始化ArcFace模型 - 使用正确的方法
+            self.arcface_model = FaceAnalysis(providers=['CPUExecutionProvider'])
             self.arcface_model.prepare(ctx_id=0, det_size=(640, 640))
-            self.arcface_model.load_model("./models/buffalo_l")
 
             # 初始化FaceNet模型作为备选
             self.facenet_model = InceptionResnetV1(
@@ -50,8 +56,11 @@ class FaceRecognition:
             self.classifier = model_data['classifier']
             self.label_encoder = model_data['label_encoder']
             self.dorm_members = model_data['dorm_members']
+            # 确保加载training_data
+            self.training_data = model_data.get('training_data', {})
             self.model_loaded = True
             print(f"分类器加载成功，成员: {', '.join(self.dorm_members)}")
+            print(f"训练数据包含 {len(self.training_data)} 个类别")
             return True
         except Exception as e:
             print(f"分类器加载失败: {str(e)}")
@@ -61,11 +70,15 @@ class FaceRecognition:
     def extract_features(self, face_img):
         """使用ArcFace提取人脸特征"""
         try:
+            if face_img.size == 0:
+                print("错误：空的人脸图像")
+                return None
             # 将图像从BGR转换为RGB
             rgb_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
             faces = self.arcface_model.get(rgb_img)
             if faces:
                 return faces[0].embedding
+            print("未检测到人脸特征")
             return None
         except Exception as e:
             print(f"特征提取失败: {str(e)}")
@@ -97,6 +110,100 @@ class FaceRecognition:
         face_img = torch.tensor(face_img).permute(2, 0, 1)  # HWC to CHW
 
         return face_img
+
+    def retrain_with_feedback(self, feedback_data):
+        """使用反馈数据重新训练模型"""
+        # 检查是否有原始训练数据
+        if not self.training_data:
+            print("错误：没有可用的原始训练数据")
+            return False
+
+        # 收集原始训练数据
+        original_features = []
+        original_labels = []
+
+        # 收集特征和标签
+        for member, embeddings in self.training_data.items():
+            for emb in embeddings:
+                original_features.append(emb)
+                original_labels.append(member)
+
+        # 收集反馈数据
+        feedback_features = []
+        feedback_labels = []
+
+        for feedback in feedback_data:
+            # 获取正确标签
+            correct_label = feedback.get("correct_label")
+            if not correct_label or correct_label == "unknown":
+                continue
+
+            # 获取原始图像和人脸位置
+            image_path = feedback.get("image_path", "")
+            if not image_path or not os.path.exists(image_path):
+                print(f"图像路径无效: {image_path}")
+                continue
+
+            box = feedback.get("box", [])
+            if len(box) != 4:
+                print(f"无效的人脸框: {box}")
+                continue
+
+            # 处理图像
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"无法读取图像: {image_path}")
+                continue
+
+            # 裁剪人脸区域
+            x1, y1, x2, y2 = map(int, box)
+            face_img = image[y1:y2, x1:x2]
+            if face_img.size == 0:
+                print(f"裁剪后的人脸图像为空: {image_path}")
+                continue
+
+            # 提取特征
+            embedding = self.extract_features(face_img)
+            if embedding is None:
+                print(f"无法提取特征: {image_path}")
+                continue
+
+            # 添加到训练数据
+            feedback_features.append(embedding)
+            feedback_labels.append(correct_label)
+
+            print(f"添加反馈数据: {correct_label} - {image_path}")
+
+        # 检查是否有有效的反馈数据
+        if not feedback_features:
+            print("错误：没有有效的反馈数据")
+            return False
+
+        # 合并数据
+        all_features = np.vstack([original_features, feedback_features])
+        all_labels = original_labels + feedback_labels
+
+        # 重新训练分类器
+        self.classifier = SVC(kernel='linear', probability=True)
+        self.classifier.fit(all_features, all_labels)
+
+        # 更新标签编码器
+        self.label_encoder = LabelEncoder()
+        self.label_encoder.fit(all_labels)
+
+        # 更新寝室成员列表
+        self.dorm_members = list(self.label_encoder.classes_)
+
+        # 更新训练数据
+        self.training_data = {}
+        for label, feature in zip(all_labels, all_features):
+            if label not in self.training_data:
+                self.training_data[label] = []
+            self.training_data[label].append(feature)
+
+        print(f"重新训练完成! 新模型包含 {len(self.dorm_members)} 个成员")
+        return True
+
 
     def recognize(self, image, threshold=0.7):
         """识别人脸"""
@@ -147,31 +254,62 @@ class FaceRecognition:
         return results, display_img
 
     def save_feedback(self, image, detected_box, incorrect_label, correct_label):
-        """保存用户反馈数据"""
+        """保存用户反馈数据 - 改进为保存图像路径而非完整图像"""
         feedback_dir = "data/feedback_data"
         os.makedirs(feedback_dir, exist_ok=True)
 
         # 创建唯一文件名
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"feedback_{timestamp}.pkl"
+
+        # 保存人脸图像
+        face_img_dir = os.path.join(feedback_dir, "faces")
+        os.makedirs(face_img_dir, exist_ok=True)
+        face_img_path = os.path.join(face_img_dir, f"face_{timestamp}.jpg")
+
+        # 裁剪并保存人脸区域
+        x1, y1, x2, y2 = map(int, detected_box)
+
+        # 修复1：确保裁剪区域有效
+        if y2 > y1 and x2 > x1:
+            face_img = image[y1:y2, x1:x2]
+            if face_img.size > 0:
+                cv2.imwrite(face_img_path, face_img)
+            else:
+                logger.warning(f"裁剪的人脸区域无效: {detected_box}")
+                face_img_path = None
+        else:
+            logger.warning(f"无效的检测框: {detected_box}")
+            face_img_path = None
+
+        # 保存反馈元数据
+        filename = f"feedback_{timestamp}.json"  # 修复2：使用JSON格式
         filepath = os.path.join(feedback_dir, filename)
 
         # 准备数据
         feedback_data = {
-            "image": image,
+            "image_path": face_img_path,  # 保存路径而非完整图像
             "detected_box": detected_box,
             "incorrect_label": incorrect_label,
             "correct_label": correct_label,
             "timestamp": timestamp
         }
 
-        # 保存数据
-        with open(filepath, "wb") as f:
-            pickle.dump(feedback_data, f)
+        # 修复3：使用JSON保存便于阅读和调试
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(feedback_data, f, ensure_ascii=False, indent=2)
 
-        print(f"反馈数据已保存: {filepath}")
         return True
 
+    def save_updated_model(self, output_path):
+        """保存更新后的模型"""
+        model_data = {
+            'classifier': self.classifier,
+            'label_encoder': self.label_encoder,
+            'dorm_members': self.dorm_members,
+            'training_data': self.training_data  # 包含训练数据
+        }
+        joblib.dump(model_data, output_path)
+        print(f"更新后的模型已保存到: {output_path}")
 
 class TripletFaceDataset(Dataset):
     """三元组人脸数据集"""
