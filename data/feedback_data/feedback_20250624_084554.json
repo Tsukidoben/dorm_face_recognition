@@ -1,0 +1,12 @@
+{
+  "timestamp": "2025-06-24T08:45:54.562710",
+  "original_label": "陌生人",
+  "correct_label": "huge",
+  "confidence": 0.6801780220835906,
+  "position": [
+    1082,
+    553
+  ],
+  "note": "",
+  "image_path": "E:\\pycharm\\study\\dorm_face_recognition\\data\\feedback_data\\images\\feedback_image_20250624_084554.jpg"
+}

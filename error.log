@@ -1,0 +1,9 @@
+
+
+2025-06-24 09:08:55.226896:
+Traceback (most recent call last):
+  File "E:\pycharm\study\dorm_face_recognition\new.py", line 610, in open_image
+    self.recognize_faces(image)
+  File "E:\pycharm\study\dorm_face_recognition\new.py", line 661, in recognize_faces
+    boxes, probs, _ = self.detector.detect(pil_image, landmarks=True)
+AttributeError: 'FaceRecognitionSystem' object has no attribute 'detector'
